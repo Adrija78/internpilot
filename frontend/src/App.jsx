@@ -6,6 +6,7 @@ const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 const HISTORY_KEY = "internpilot_search_history_v1";
 const CLIENT_ID_KEY = "internpilot_client_id_v1";
+const HISTORY_LIMIT = 50;
 
 const escapeHtml = (value = "") =>
   String(value)
@@ -230,6 +231,33 @@ const decodeGoogleJwt = (token) => {
   }
 };
 
+const loadLocalHistory = () => {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+};
+
+const normalizeHistoryItem = (item = {}) => ({
+  ...item,
+  id: item.id ?? `${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+  created_at: item.created_at || item.createdAt || new Date().toISOString(),
+});
+
+const mergeHistory = (localItems = [], remoteItems = []) => {
+  const map = new Map();
+  [...remoteItems, ...localItems].forEach((entry) => {
+    const normalized = normalizeHistoryItem(entry);
+    map.set(String(normalized.id), normalized);
+  });
+  return Array.from(map.values())
+    .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+    .slice(0, HISTORY_LIMIT);
+};
+
 function App() {
   const [file, setFile] = useState(null);
   const [job, setJob] = useState("");
@@ -343,19 +371,16 @@ function App() {
   useEffect(() => {
     if (!clientId) return;
     const loadHistory = async () => {
+      const localItems = loadLocalHistory();
+      setSearchHistory(localItems.slice(0, HISTORY_LIMIT));
       try {
         const res = await axios.get(`${API_BASE}/history`, {
           params: { client_id: clientId },
         });
-        setSearchHistory(Array.isArray(res.data) ? res.data : []);
+        const remoteItems = Array.isArray(res.data) ? res.data : [];
+        setSearchHistory((prev) => mergeHistory(prev.length ? prev : localItems, remoteItems));
       } catch (error) {
-        const raw = localStorage.getItem(HISTORY_KEY);
-        try {
-          const parsed = raw ? JSON.parse(raw) : [];
-          setSearchHistory(Array.isArray(parsed) ? parsed : []);
-        } catch {
-          setSearchHistory([]);
-        }
+        setSearchHistory(localItems.slice(0, HISTORY_LIMIT));
       } finally {
         historyHydratedRef.current = true;
       }
@@ -365,24 +390,24 @@ function App() {
 
   useEffect(() => {
     if (!historyHydratedRef.current) return;
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(searchHistory.slice(0, 20)));
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(searchHistory.slice(0, HISTORY_LIMIT)));
   }, [searchHistory]);
 
   const addHistory = (entry) => {
+    const localEntry = normalizeHistoryItem({
+      ...entry,
+      id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    });
+    setSearchHistory((prev) => mergeHistory([localEntry, ...prev], []));
+
     if (!clientId) return;
     axios
       .post(`${API_BASE}/history/add`, entry, { params: { client_id: clientId } })
       .then((res) => {
-        const row = res.data;
-        setSearchHistory((prev) => [row, ...prev.filter((item) => item.id !== row.id)].slice(0, 20));
+        const row = normalizeHistoryItem(res.data || {});
+        setSearchHistory((prev) => mergeHistory(prev, [row]));
       })
-      .catch(() => {
-        const id = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-        setSearchHistory((prev) => {
-          const next = [{ id, createdAt: new Date().toISOString(), ...entry }, ...prev];
-          return next.slice(0, 20);
-        });
-      });
+      .catch(() => {});
   };
 
   const removeHistory = (id) => {
