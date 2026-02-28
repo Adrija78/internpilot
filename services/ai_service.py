@@ -11,6 +11,23 @@ COMMON_SKILLS = [
     "Supply Chain","Operations","Project Management","Risk Management"
 ]
 
+GENERIC_NON_SKILLS = {
+    "developer", "engineer", "analyst", "specialist", "associate", "manager",
+    "job", "role", "position", "hiring", "looking", "seeking", "candidate",
+    "web", "frontend", "backend"
+}
+
+ROLE_SKILL_TEMPLATES = {
+    "web developer": ["HTML", "CSS", "JavaScript", "React", "Git", "REST API"],
+    "python developer": ["Python", "Django", "Flask", "FastAPI", "SQL", "Git"],
+    "java developer": ["Java", "Spring Boot", "SQL", "REST API", "Git", "OOP"],
+    "frontend developer": ["HTML", "CSS", "JavaScript", "React", "TypeScript", "UI"],
+    "backend developer": ["Python", "Java", "Node.js", "SQL", "REST API", "Docker"],
+    "cybersecurity analyst": ["Network Security", "SIEM", "Incident Response", "Vulnerability Assessment", "IAM", "Risk Management"],
+    "cyber security analyst": ["Network Security", "SIEM", "Incident Response", "Vulnerability Assessment", "IAM", "Risk Management"],
+    "blockchain developer": ["Blockchain", "Solidity", "Smart Contracts", "Web3", "Ethereum", "Cryptography"],
+}
+
 async def analyze_resume(text:str):
     known = [s for s in COMMON_SKILLS if s.lower() in text.lower()]
     inferred = _extract_general_keywords(text, limit=18)
@@ -25,12 +42,31 @@ async def analyze_resume(text:str):
     return {"skills": merged[:20]}
 
 async def analyze_job(text:str):
+    role_title = _extract_role_title(text)
+    role_family = _detect_role_family(text, role_title)
+
+    template_skills = []
+    lowered = f"{text} {role_title}".lower()
+    for role_key, skills in ROLE_SKILL_TEMPLATES.items():
+        if role_key in lowered:
+            template_skills = skills
+            break
+
     skills = _extract_role_keywords(text, limit=14)
     if not skills:
         skills = _extract_general_keywords(text, limit=10)
-    role_title = _extract_role_title(text)
-    role_family = _detect_role_family(text, role_title)
-    return {"required_skills": skills, "role_title": role_title, "role_family": role_family}
+    merged = []
+    seen = set()
+    for item in template_skills + skills:
+        normalized = _normalize_skill(item)
+        if not normalized or normalized in GENERIC_NON_SKILLS:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        merged.append(item)
+
+    return {"required_skills": merged[:14], "role_title": role_title, "role_family": role_family}
 
 def calculate_match(resume_data,job_data):
     job_skills = list(dict.fromkeys(job_data["required_skills"]))
@@ -190,6 +226,8 @@ def _extract_general_keywords(text: str, limit: int = 12):
     output = []
     for token, _ in ranked_tokens:
         cleaned = aliases.get(token, token.capitalize())
+        if cleaned.lower() in GENERIC_NON_SKILLS:
+            continue
         output.append(cleaned)
         if len(output) >= limit:
             break
@@ -233,6 +271,7 @@ def _extract_role_title(job_text: str):
     if pattern_hiring:
         phrase = pattern_hiring.group(1).strip(" -")
         if phrase:
+            phrase = re.sub(r"\b(job|position|role)\b$", "", phrase, flags=re.IGNORECASE).strip(" -")
             return " ".join(word.capitalize() for word in phrase.split())
 
     explicit = re.search(
@@ -258,7 +297,9 @@ def _extract_role_title(job_text: str):
 
     first_line = _first_nonempty_line(job_text)
     if first_line:
-        return first_line.strip(" -|:")
+        title = first_line.strip(" -|:")
+        title = re.sub(r"\b(job|position|role)\b$", "", title, flags=re.IGNORECASE).strip(" -|:")
+        return title
     return "Target Role Candidate"
 
 
@@ -318,6 +359,8 @@ def _extract_role_keywords(job_text: str, limit: int = 14):
         if normalized_token in known_parts:
             continue
         cleaned = aliases.get(normalized_token, normalized_token.capitalize())
+        if cleaned.lower() in GENERIC_NON_SKILLS:
+            continue
         if cleaned.lower() in seen_lower:
             continue
         inferred.append(cleaned)
@@ -360,6 +403,12 @@ def _bucket_skills(keywords):
 
 def _role_focus_sentence(role_title: str):
     lowered = role_title.lower()
+    if "law" in lowered or "legal" in lowered or "lawyer" in lowered:
+        return "advising on risk, contracts, and compliance with clear legal judgment"
+    if "finance" in lowered or "account" in lowered or "audit" in lowered or "analyst" in lowered:
+        return "delivering accurate analysis, reporting discipline, and decision-ready insights"
+    if "hr" in lowered or "human resources" in lowered or "recruit" in lowered:
+        return "driving people processes, hiring coordination, and employee lifecycle execution"
     if "data" in lowered or "analyst" in lowered:
         return "translating data into business decisions"
     if "marketing" in lowered or "seo" in lowered:
@@ -381,6 +430,34 @@ def _extract_first_matching_url(text: str, domain_hint: str = ""):
                 return url
         return ""
     return matches[0]
+
+
+def _summary_tail_by_role_family(role_family: str):
+    mapping = {
+        "legal": "Produces evidence-backed casework, legal notes, and risk-focused documentation.",
+        "finance": "Produces audit-ready analysis, reconciliations, and business-impact commentary.",
+        "hr": "Produces hiring/people operations outputs with clear process and compliance discipline.",
+        "marketing": "Produces campaign and growth outputs tied to measurable performance metrics.",
+        "operations": "Produces process-improvement outputs with quality and cycle-time impact.",
+        "software": "Produces delivery-ready implementation outputs with scalable engineering practices.",
+        "data": "Produces analytics outputs that support reliable, metric-driven decisions.",
+    }
+    return mapping.get(role_family, "Produces outcome-focused work samples with measurable business impact.")
+
+
+def _skill_group_labels(role_family: str):
+    if role_family in {"legal", "finance", "hr", "marketing", "operations"}:
+        return {"technical": "Functional", "core": "Core"}
+    return {"technical": "Technical", "core": "Core"}
+
+
+def _preferred_links_by_role_family(role_family: str):
+    # Order controls rendering priority in UI/export.
+    if role_family in {"legal", "finance", "hr", "marketing", "operations"}:
+        return ["linkedin", "portfolio"]
+    if role_family in {"software", "data"}:
+        return ["linkedin", "github", "portfolio"]
+    return ["linkedin", "portfolio"]
 
 
 def evaluate_answer(answer: str):
@@ -506,10 +583,11 @@ async def generate_resume_reference(
 
     top_keywords = role_keywords[:5]
     role_focus = _role_focus_sentence(role_title)
+    summary_tail = _summary_tail_by_role_family(role_family)
     summary = (
         f"{role_title} profile with a track record of {role_focus}. "
         f"Demonstrates alignment with target requirements in {', '.join(top_keywords[:3])}. "
-        f"Builds outcomes-focused projects and communicates impact with clear, measurable results."
+        f"{summary_tail}"
     )
     if profile_text.strip():
         summary = f"{summary} Background context to incorporate: {profile_text.strip()}"
@@ -528,10 +606,12 @@ async def generate_resume_reference(
     education_hint = "B.S. / B.Tech in Relevant Discipline"
     experience_bullets = []
     projects = []
+    experience_role_label = f"{role_title} Professional"
 
     if role_family == "legal":
         work_samples_label = "CASEWORK / LEGAL MATTERS"
         education_hint = "LL.B / LL.M / Relevant Legal Qualification"
+        experience_role_label = f"{role_title} Trainee / Legal Associate"
         experience_bullets = [
             "Drafted and reviewed contracts, identifying legal and commercial risk clauses with clear mitigation notes.",
             "Conducted legal research and prepared concise briefs for internal teams and client communication.",
@@ -558,6 +638,7 @@ async def generate_resume_reference(
     elif role_family == "finance":
         work_samples_label = "ANALYSIS HIGHLIGHTS"
         education_hint = "B.Com / M.Com / CA / CFA / Finance Degree"
+        experience_role_label = f"{role_title} Trainee / Analyst"
         experience_bullets = [
             "Performed financial analysis on cost, revenue, and variance trends to support business decisions.",
             "Prepared reconciliations and reporting packs with high accuracy and timeline discipline.",
@@ -584,6 +665,7 @@ async def generate_resume_reference(
     elif role_family == "hr":
         work_samples_label = "HR INITIATIVES"
         education_hint = "MBA HR / BBA / Human Resources Degree"
+        experience_role_label = f"{role_title} Trainee / HR Associate"
         experience_bullets = [
             "Managed recruitment coordination, interview scheduling, and candidate communication workflows.",
             "Maintained hiring tracker and improved turnaround visibility for stakeholders.",
@@ -610,6 +692,7 @@ async def generate_resume_reference(
     elif role_family == "marketing":
         work_samples_label = "CAMPAIGN HIGHLIGHTS"
         education_hint = "Marketing / Business / Communications Degree"
+        experience_role_label = f"{role_title} Trainee / Marketing Associate"
         experience_bullets = [
             "Planned and executed campaign tasks across channels with performance tracking.",
             "Analyzed CTR, conversion, and engagement metrics to optimize messaging.",
@@ -636,6 +719,7 @@ async def generate_resume_reference(
     elif role_family == "operations":
         work_samples_label = "PROCESS IMPROVEMENT HIGHLIGHTS"
         education_hint = "Operations / Supply Chain / Business Degree"
+        experience_role_label = f"{role_title} Trainee / Operations Associate"
         experience_bullets = [
             "Mapped workflows and removed bottlenecks to improve turnaround time and quality.",
             "Defined SOP checkpoints and monitored adherence with issue-tracking.",
@@ -717,16 +801,19 @@ async def generate_resume_reference(
         "github": github_url,
         "portfolio": portfolio_url,
         "headline": role_title,
+        "role_family": role_family,
         "summary": summary,
         "skills": role_keywords,
         "skills_grouped": {
             "technical": tech_skills,
             "core": core_skills,
         },
+        "skill_group_labels": _skill_group_labels(role_family),
         "work_samples_label": work_samples_label,
+        "preferred_links": _preferred_links_by_role_family(role_family),
         "experience": [
             {
-                "role": f"{role_title} Intern / Project Contributor",
+                "role": experience_role_label,
                 "org": "Company / Lab / Student Organization",
                 "duration": "MM/YYYY - Present",
                 "bullets": experience_bullets,

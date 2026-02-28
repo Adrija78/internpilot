@@ -4,6 +4,8 @@ import "./App.css";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
+const HISTORY_KEY = "internpilot_search_history_v1";
+const CLIENT_ID_KEY = "internpilot_client_id_v1";
 
 const escapeHtml = (value = "") =>
   String(value)
@@ -15,8 +17,34 @@ const escapeHtml = (value = "") =>
 
 const isHttpUrl = (value = "") => /^https?:\/\//i.test(String(value).trim());
 
+const getVisibleLinks = (reference = {}) => {
+  const preferred = Array.isArray(reference.preferred_links)
+    ? reference.preferred_links
+    : ["linkedin", "github", "portfolio"];
+
+  const labels = {
+    linkedin: "LinkedIn",
+    github: "GitHub",
+    portfolio: "Portfolio",
+  };
+
+  return preferred
+    .map((key) => ({ key, label: labels[key] || key, value: reference[key] || "" }))
+    .filter((item) => item.label);
+};
+
+const buildLinkDisplayItems = (reference = {}) =>
+  getVisibleLinks(reference).map((link) => ({
+    ...link,
+    isValid: isHttpUrl(link.value),
+    fallback: `${link.label}: add URL`,
+  }));
+
 const buildResumeDocumentHtml = (reference) => {
   const skillsGrouped = reference.skills_grouped || {};
+  const skillGroupLabels = reference.skill_group_labels || {};
+  const technicalLabel = skillGroupLabels.technical || "Technical";
+  const coreLabel = skillGroupLabels.core || "Core";
   const technical = skillsGrouped.technical || [];
   const core = skillsGrouped.core || [];
   const experience = reference.experience || [];
@@ -30,6 +58,10 @@ const buildResumeDocumentHtml = (reference) => {
     isHttpUrl(url)
       ? `<a href="${escapeHtml(url)}">${escapeHtml(label)}</a>`
       : escapeHtml(`${label}: add URL`);
+  const visibleLinks = buildLinkDisplayItems(reference);
+  const visibleLinkHtml = visibleLinks
+    .map((link) => docLink(link.value, link.label))
+    .join(" | ");
 
   return `
 <!doctype html>
@@ -55,9 +87,7 @@ const buildResumeDocumentHtml = (reference) => {
   <body>
     <h1>${escapeHtml(reference.name || "Your Name")}</h1>
     <div class="contact">${escapeHtml(reference.email || "")} | ${escapeHtml(reference.phone || "")} | ${escapeHtml(reference.location || "")}</div>
-    <div class="contact">
-      ${docLink(reference.linkedin, "LinkedIn")} | ${docLink(reference.github, "GitHub")} | ${docLink(reference.portfolio, "Portfolio")}
-    </div>
+    <div class="contact">${visibleLinkHtml}</div>
     <div class="headline">${escapeHtml(reference.headline || "")}</div>
 
     <h2>SUMMARY</h2>
@@ -66,10 +96,10 @@ const buildResumeDocumentHtml = (reference) => {
     <h2>SKILLS</h2>
     ${
       technical.length
-        ? `<p><span class="label">Technical:</span> ${escapeHtml(technical.join(", "))}</p>`
+        ? `<p><span class="label">${escapeHtml(technicalLabel)}:</span> ${escapeHtml(technical.join(", "))}</p>`
         : ""
     }
-    ${core.length ? `<p><span class="label">Core:</span> ${escapeHtml(core.join(", "))}</p>` : ""}
+    ${core.length ? `<p><span class="label">${escapeHtml(coreLabel)}:</span> ${escapeHtml(core.join(", "))}</p>` : ""}
     ${
       !technical.length && !core.length
         ? `<p>${escapeHtml((reference.skills || []).join(", "))}</p>`
@@ -220,6 +250,9 @@ function App() {
   const [resumeDraft, setResumeDraft] = useState(null);
   const [resumeDraftText, setResumeDraftText] = useState("");
   const [resumeIntel, setResumeIntel] = useState(null);
+  const [searchHistory, setSearchHistory] = useState([]);
+  const [clientId, setClientId] = useState("");
+  const [historyOpen, setHistoryOpen] = useState(true);
   const [authUser, setAuthUser] = useState(null);
   const [showAuthGate, setShowAuthGate] = useState(false);
   const [authError, setAuthError] = useState("");
@@ -236,6 +269,9 @@ function App() {
   const [demoOtpCode, setDemoOtpCode] = useState("");
   const [smtpStatus, setSmtpStatus] = useState(null);
   const googleButtonRef = useRef(null);
+  const swipeStartXRef = useRef(null);
+  const swipeStartYRef = useRef(null);
+  const historyHydratedRef = useRef(false);
 
   const modeCards = [
     {
@@ -294,6 +330,72 @@ function App() {
     setGoogleClientId(initial);
     setGoogleClientIdInput(initial);
   }, []);
+
+  useEffect(() => {
+    let id = localStorage.getItem(CLIENT_ID_KEY);
+    if (!id) {
+      id = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+      localStorage.setItem(CLIENT_ID_KEY, id);
+    }
+    setClientId(id);
+  }, []);
+
+  useEffect(() => {
+    if (!clientId) return;
+    const loadHistory = async () => {
+      try {
+        const res = await axios.get(`${API_BASE}/history`, {
+          params: { client_id: clientId },
+        });
+        setSearchHistory(Array.isArray(res.data) ? res.data : []);
+      } catch (error) {
+        const raw = localStorage.getItem(HISTORY_KEY);
+        try {
+          const parsed = raw ? JSON.parse(raw) : [];
+          setSearchHistory(Array.isArray(parsed) ? parsed : []);
+        } catch {
+          setSearchHistory([]);
+        }
+      } finally {
+        historyHydratedRef.current = true;
+      }
+    };
+    loadHistory();
+  }, [clientId]);
+
+  useEffect(() => {
+    if (!historyHydratedRef.current) return;
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(searchHistory.slice(0, 20)));
+  }, [searchHistory]);
+
+  const addHistory = (entry) => {
+    if (!clientId) return;
+    axios
+      .post(`${API_BASE}/history/add`, entry, { params: { client_id: clientId } })
+      .then((res) => {
+        const row = res.data;
+        setSearchHistory((prev) => [row, ...prev.filter((item) => item.id !== row.id)].slice(0, 20));
+      })
+      .catch(() => {
+        const id = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+        setSearchHistory((prev) => {
+          const next = [{ id, createdAt: new Date().toISOString(), ...entry }, ...prev];
+          return next.slice(0, 20);
+        });
+      });
+  };
+
+  const removeHistory = (id) => {
+    setSearchHistory((prev) => prev.filter((item) => item.id !== id));
+    if (!clientId || typeof id !== "number") return;
+    axios.delete(`${API_BASE}/history/${id}`, { params: { client_id: clientId } }).catch(() => {});
+  };
+
+  const clearHistory = () => {
+    setSearchHistory([]);
+    if (!clientId) return;
+    axios.delete(`${API_BASE}/history/clear`, { params: { client_id: clientId } }).catch(() => {});
+  };
 
   useEffect(() => {
     if (window.google?.accounts?.id) {
@@ -433,6 +535,12 @@ function App() {
         setResumeDraft(res.data.resume_reference || null);
         setResumeDraftText(res.data.resume_text || "");
         setResumeIntel(res.data || null);
+        addHistory({
+          mode,
+          job,
+          title: currentMode.title,
+          summary: `Generated model resume for ${res.data?.resume_reference?.headline || "target role"}`,
+        });
         return;
       }
 
@@ -450,6 +558,12 @@ function App() {
           setInterviewQuestions(questions);
           setSelectedQuestion(questions[0]);
           setInterviewAnswer("");
+          addHistory({
+            mode,
+            job,
+            title: currentMode.title,
+            summary: `Generated ${questions.length} interview question(s)`,
+          });
           return;
         }
 
@@ -467,10 +581,24 @@ function App() {
         });
 
         setInterviewEval(evalRes.data);
+        addHistory({
+          mode,
+          job,
+          title: currentMode.title,
+          summary: `Interview score: ${evalRes.data?.score ?? "-"}`,
+        });
         return;
       }
 
-      await ensureAnalysis();
+      const analysis = await ensureAnalysis();
+      if (analysis) {
+        addHistory({
+          mode,
+          job,
+          title: currentMode.title,
+          summary: `Match score: ${analysis.match_score ?? "-"}%`,
+        });
+      }
     } catch (err) {
       console.log(err);
       alert("Backend request failed. Check backend terminal and API URL.");
@@ -593,10 +721,46 @@ function App() {
     }
   };
 
+  const onAppTouchStart = (event) => {
+    const touch = event.changedTouches?.[0];
+    if (!touch) return;
+    swipeStartXRef.current = touch.clientX;
+    swipeStartYRef.current = touch.clientY;
+  };
+
+  const onAppTouchEnd = (event) => {
+    const touch = event.changedTouches?.[0];
+    if (!touch) return;
+    if (swipeStartXRef.current === null || swipeStartYRef.current === null) return;
+
+    const deltaX = touch.clientX - swipeStartXRef.current;
+    const deltaY = touch.clientY - swipeStartYRef.current;
+    const mostlyHorizontal = Math.abs(deltaX) > Math.abs(deltaY);
+    if (!mostlyHorizontal) return;
+
+    if (deltaX > 60) {
+      setHistoryOpen(true);
+    } else if (deltaX < -60) {
+      setHistoryOpen(false);
+    }
+  };
+
   return (
-    <div className="app">
+    <div
+      className={`app ${historyOpen ? "history-open" : "history-closed"}`}
+      onTouchStart={onAppTouchStart}
+      onTouchEnd={onAppTouchEnd}
+    >
       <div className="sidebar">
         <img src="/internpilot-icon.svg" alt="InternPilot icon" className="sidebar-logo" />
+        <button
+          className={`rail-btn ${historyOpen ? "active" : ""}`}
+          onClick={() => setHistoryOpen((prev) => !prev)}
+          aria-label="Search history"
+          title="Search history"
+        >
+          H
+        </button>
         <button
           className={`rail-btn ${mode === "agent" ? "active" : ""}`}
           onClick={() => setMode("agent")}
@@ -630,6 +794,46 @@ function App() {
           B
         </button>
       </div>
+
+      <aside className={`history-sidebar ${historyOpen ? "open" : "closed"}`}>
+        <div className="history-sidebar-header">
+          <h3>Search History</h3>
+          {searchHistory.length > 0 && (
+            <button className="attach-btn history-clear-btn" onClick={clearHistory}>
+              Clear
+            </button>
+          )}
+        </div>
+
+        <div className="history-sidebar-list">
+          {searchHistory.length === 0 && <p className="history-empty">No searches yet.</p>}
+          {searchHistory.map((item) => (
+            <div key={item.id} className="history-sidebar-item">
+              <button
+                className="history-load-btn"
+                onClick={() => {
+                  setMode(item.mode);
+                  setJob(item.job);
+                  window.scrollTo({ top: 0, behavior: "smooth" });
+                }}
+                title={item.job}
+              >
+                <span className="history-item-mode">{item.title}</span>
+                <span className="history-item-summary">{item.summary}</span>
+                <span className="history-item-job">{item.job}</span>
+              </button>
+              <button
+                className="history-delete-btn"
+                onClick={() => removeHistory(item.id)}
+                aria-label="Delete history item"
+                title="Delete"
+              >
+                x
+              </button>
+            </div>
+          ))}
+        </div>
+      </aside>
 
       <div className="canvas">
         <div className="orb" />
@@ -807,38 +1011,31 @@ function App() {
               </p>
             )}
             <div className="resume-template">
+              {(() => {
+                const visibleLinks = buildLinkDisplayItems(resumeDraft);
+                return (
               <div className="resume-template-header">
                 <h3>{resumeDraft.name || "Your Name"}</h3>
                 <p>
                   {resumeDraft.email} | {resumeDraft.phone} | {resumeDraft.location}
                 </p>
                 <p>
-                  {isHttpUrl(resumeDraft.linkedin) ? (
-                    <a href={resumeDraft.linkedin} target="_blank" rel="noreferrer">
-                      LinkedIn
-                    </a>
-                  ) : (
-                    <span>LinkedIn: add URL</span>
-                  )}{" "}
-                  |{" "}
-                  {isHttpUrl(resumeDraft.github) ? (
-                    <a href={resumeDraft.github} target="_blank" rel="noreferrer">
-                      GitHub
-                    </a>
-                  ) : (
-                    <span>GitHub: add URL</span>
-                  )}{" "}
-                  |{" "}
-                  {isHttpUrl(resumeDraft.portfolio) ? (
-                    <a href={resumeDraft.portfolio} target="_blank" rel="noreferrer">
-                      Portfolio
-                    </a>
-                  ) : (
-                    <span>Portfolio: add URL</span>
-                  )}
+                  {visibleLinks
+                    .map((link) =>
+                      link.isValid ? (
+                        <a key={link.key} href={link.value} target="_blank" rel="noreferrer">
+                          {link.label}
+                        </a>
+                      ) : (
+                        <span key={link.key}>{link.fallback}</span>
+                      )
+                    )
+                    .reduce((acc, node, idx) => (idx === 0 ? [node] : [...acc, " | ", node]), [])}
                 </p>
                 <p className="resume-template-headline">{resumeDraft.headline}</p>
               </div>
+                );
+              })()}
 
               <section>
                 <h4>Summary</h4>
@@ -847,20 +1044,29 @@ function App() {
 
               <section>
                 <h4>Skills</h4>
+                {(() => {
+                  const labels = resumeDraft.skill_group_labels || {};
+                  const technicalLabel = labels.technical || "Technical";
+                  const coreLabel = labels.core || "Core";
+                  return (
+                    <>
                 {resumeDraft.skills_grouped?.technical?.length > 0 && (
                   <p>
-                    <strong>Technical:</strong> {resumeDraft.skills_grouped.technical.join(", ")}
+                    <strong>{technicalLabel}:</strong> {resumeDraft.skills_grouped.technical.join(", ")}
                   </p>
                 )}
                 {resumeDraft.skills_grouped?.core?.length > 0 && (
                   <p>
-                    <strong>Core:</strong> {resumeDraft.skills_grouped.core.join(", ")}
+                    <strong>{coreLabel}:</strong> {resumeDraft.skills_grouped.core.join(", ")}
                   </p>
                 )}
                 {!resumeDraft.skills_grouped?.technical?.length &&
                   !resumeDraft.skills_grouped?.core?.length && (
                     <p>{(resumeDraft.skills || []).join(", ")}</p>
                   )}
+                    </>
+                  );
+                })()}
               </section>
 
               <section>
@@ -881,7 +1087,7 @@ function App() {
               </section>
 
               <section>
-                <h4>Projects</h4>
+                <h4>{resumeDraft.work_samples_label || "PROJECTS"}</h4>
                 {(resumeDraft.projects || []).map((project, idx) => (
                   <div key={`${project.title}-${idx}`} className="resume-entry">
                     <p className="resume-entry-title">{project.title}</p>

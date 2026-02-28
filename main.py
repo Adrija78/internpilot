@@ -1,10 +1,13 @@
 from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone
 import random
 import re
 import os
 import smtplib
+import sqlite3
+import tempfile
 from email.message import EmailMessage
 
 from services.ai_service import (
@@ -29,12 +32,30 @@ from utils.parser import extract_text_from_pdf
 app = FastAPI()
 OTP_STORE = {}
 OTP_TTL_MINUTES = 10
+DB_FILENAME = "internpilot_history.db"
 SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "").strip()
 SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
 SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER).strip()
 CORS_ORIGINS_ENV = os.getenv("CORS_ORIGINS", "").strip()
+
+
+def _resolve_db_path():
+    explicit_path = os.getenv("HISTORY_DB_PATH", "").strip()
+    if explicit_path:
+        return explicit_path
+
+    # Render persistent disks are commonly mounted under an environment-provided path.
+    render_disk_path = os.getenv("RENDER_DISK_PATH", "").strip()
+    if render_disk_path:
+        return os.path.join(render_disk_path, DB_FILENAME)
+
+    # Safe cross-platform fallback for local/dev and ephemeral hosts.
+    return os.path.join(tempfile.gettempdir(), DB_FILENAME)
+
+
+DB_PATH = _resolve_db_path()
 
 
 def _allowed_origins():
@@ -88,6 +109,53 @@ def _send_otp_email(recipient_email: str, otp_code: str):
         server.starttls()
         server.login(SMTP_USER, SMTP_PASS)
         server.send_message(msg)
+
+
+def _db_connect():
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+    except sqlite3.OperationalError:
+        # Last-resort fallback so history feature keeps working even if path is not writable.
+        fallback_path = os.path.join(tempfile.gettempdir(), DB_FILENAME)
+        conn = sqlite3.connect(fallback_path)
+
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_db():
+    conn = _db_connect()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS search_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                job TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+_init_db()
+
+
+class HistoryItemIn(BaseModel):
+    mode: str
+    title: str
+    summary: str
+    job: str
 
 app.add_middleware(
     CORSMiddleware,
@@ -233,6 +301,76 @@ async def smtp_status():
         "configured": len(missing) == 0,
         "missing_fields": missing,
     }
+
+
+@app.get("/history")
+async def get_history(client_id: str = Query(...)):
+    conn = _db_connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, mode, title, summary, job, created_at
+            FROM search_history
+            WHERE client_id = ?
+            ORDER BY datetime(created_at) DESC, id DESC
+            LIMIT 50
+            """,
+            (client_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
+
+
+@app.post("/history/add")
+async def add_history(item: HistoryItemIn, client_id: str = Query(...)):
+    created_at = datetime.now(timezone.utc).isoformat()
+    conn = _db_connect()
+    try:
+        cursor = conn.execute(
+            """
+            INSERT INTO search_history (client_id, mode, title, summary, job, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (client_id, item.mode, item.title, item.summary, item.job, created_at),
+        )
+        conn.commit()
+        row = conn.execute(
+            """
+            SELECT id, mode, title, summary, job, created_at
+            FROM search_history
+            WHERE id = ?
+            """,
+            (cursor.lastrowid,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row else {}
+
+
+@app.delete("/history/clear")
+async def clear_history(client_id: str = Query(...)):
+    conn = _db_connect()
+    try:
+        conn.execute("DELETE FROM search_history WHERE client_id = ?", (client_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True}
+
+
+@app.delete("/history/{item_id}")
+async def delete_history_item(item_id: int, client_id: str = Query(...)):
+    conn = _db_connect()
+    try:
+        conn.execute(
+            "DELETE FROM search_history WHERE id = ? AND client_id = ?",
+            (item_id, client_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True}
 
 
 @app.post("/extract-resume-links")
